@@ -119,9 +119,35 @@ Per scene it renders the narration, fits the picture to it, and normalises
 everything to one codec/resolution/fps before concatenating.
 
 **Scenes are cached.** A scene is re-rendered only when its narration, voice,
-rate, source file or resolution changes, so editing one line of narration
-rebuilds in seconds instead of re-rendering every VHS tape in real time. Use
-`--no-cache` to force a full rebuild, `--clean` to discard intermediates.
+rate, loudness, source file or resolution changes, so editing one line of
+narration rebuilds in seconds instead of re-rendering every VHS tape in real
+time. Use `--no-cache` to force a full rebuild, `--clean` to discard
+intermediates.
+
+**Every build also writes**, next to the mp4:
+
+| File | What it is |
+|---|---|
+| `.srt` / `.vtt` | Captions in both formats |
+| `.transcript.md` | The full narration as prose — drop into a PR or an email |
+| `.chapters.json` | Scene start times and titles, used by `page` |
+
+Voiceover is normalised to a consistent loudness (`-16` LUFS by default, set
+`"loudness"` in the storyboard, or `null` to disable), so a series of videos
+sounds level rather than drifting between recordings.
+
+### 6. Ship it as a page
+
+```bash
+python3 $SCRIPT page demo.mp4 --title "My Feature" \
+  --description "What it does." --meta "v0.9.1|alpha01"
+```
+
+Builds `page/index.html` with the video, clickable chapters that seek it,
+inlined captions, a poster frame and a collapsible transcript — then publish
+that folder as an artifact, passing `video.mp4` and `poster.jpg` as files. Give
+scenes a `"chapter"` field for good chapter titles; otherwise the first sentence
+of the narration is used.
 
 ## Writing narration that lands
 
@@ -129,9 +155,18 @@ rebuilds in seconds instead of re-rendering every VHS tape in real time. Use
   wants ~70 words. Check your clip's length (`ffprobe`) before writing.
 - **Say what is on screen, specifically.** "Equities, with Apple and Microsoft"
   beats "some data". Viewers are looking at it; vague narration reads as padding.
-- **Spell out identifiers phonetically.** `androidx.a2ui` → "androidx dot a 2 u i".
-  `material3-a2ui` → "material 3 dash a 2 u i". Version `1.0.0-alpha01` →
-  "one point zero point zero, alpha one". `say` mangles the raw strings.
+- **Don't hand-spell identifiers — use a pronunciation dictionary.** Put a
+  `pronounce.json` next to the storyboard (or a `pronounce` map inside it):
+
+  ```json
+  { "androidx.a2ui": "androidx dot a 2 u i",
+    "material3-a2ui": "material 3 dash a 2 u i",
+    "1.0.0-alpha01": "one point zero point zero, alpha one" }
+  ```
+
+  It rewrites the text **for the voice only** — captions and the transcript keep
+  the real spelling. Longest key wins, so `androidx.a2ui.compose` beats
+  `androidx.a2ui`. Write each term once per project instead of once per scene.
 - One idea per scene. Re-recording one 20-second scene is cheap; re-recording a
   two-minute take is not.
 

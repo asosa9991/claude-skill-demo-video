@@ -85,6 +85,20 @@ python3 $SCRIPT build storyboard.json
 Scenes are **cached** by content — change one line of narration and only that
 scene re-renders, instead of re-rendering every VHS tape in real time.
 
+Each build also writes a `.srt`, a `.vtt`, a `.transcript.md` and a
+`.chapters.json` beside the mp4, and normalises the voiceover to a consistent
+loudness.
+
+Then ship it as a page:
+
+```bash
+python3 $SCRIPT page demo.mp4 --title "My Feature" --meta "v0.9.1"
+```
+
+That builds `page/index.html` — the video, clickable chapters that seek it,
+inlined captions, a poster frame and a collapsible transcript — ready to publish
+or host.
+
 Or one-shot, no storyboard:
 
 ```bash
@@ -121,7 +135,9 @@ python3 $SCRIPT voices    # reports which tiers you have installed
 
 - Budget **~3 words per second** at rate 180. A 24-second clip wants ~70 words.
 - Say what is actually on screen. Viewers are looking at it.
-- Spell identifiers phonetically: `androidx.a2ui` → `"androidx dot a 2 u i"`.
+- Don't hand-spell identifiers. A `pronounce.json` beside the storyboard rewrites
+  terms **for the voice only**, so captions keep the real spelling:
+  `{"androidx.a2ui": "androidx dot a 2 u i"}`.
 - One idea per scene — re-recording 20 seconds is cheap, two minutes is not.
 
 ## Documentation

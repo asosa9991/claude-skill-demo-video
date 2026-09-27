@@ -449,10 +449,14 @@ def norm_video(src, dst, target, res, fps, src_kind="clip", workdir=None):
     return dst
 
 
-def norm_audio(vo, dst, target):
+def norm_audio(vo, dst, target, loudness=-16):
     need_ffmpeg()
     if vo and Path(vo).exists():
-        run([FFMPEG, "-y", "-i", str(vo), "-af", "apad", "-t", f"{target:.3f}",
+        # Normalise every scene to the same loudness so a series of videos, or
+        # scenes voiced at different rates, do not drift in level.
+        af = "apad" if loudness is None else \
+            f"loudnorm=I={loudness}:TP=-1.5:LRA=11,apad"
+        run([FFMPEG, "-y", "-i", str(vo), "-af", af, "-t", f"{target:.3f}",
              "-ar", "48000", "-ac", "2", "-c:a", "aac", "-b:a", "128k", str(dst)])
     else:
         run([FFMPEG, "-y", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
@@ -559,6 +563,30 @@ def estimate_tape_duration(tape_path):
     return total
 
 
+def load_pronounce(base, sb):
+    """Merge pronounce.json in the storyboard's folder with an inline `pronounce` map."""
+    rules = {}
+    f = Path(base) / "pronounce.json"
+    if f.exists():
+        try:
+            rules.update(json.loads(f.read_text()))
+        except ValueError:
+            die(f"{f} is not valid JSON")
+    rules.update(sb.get("pronounce") or {})
+    return rules
+
+
+def apply_pronounce(text, rules):
+    """Rewrite terms for the voice only. Captions keep the real spelling, so
+    the audio says 'androidx dot a 2 u i' while the caption reads androidx.a2ui.
+    Longest keys first, so a specific term wins over a prefix of it."""
+    if not rules:
+        return text
+    for key in sorted(rules, key=len, reverse=True):
+        text = text.replace(key, rules[key])
+    return text
+
+
 def resolve_path(base, value):
     q = Path(value)
     return q if q.is_absolute() else base / q
@@ -574,9 +602,9 @@ def file_sig(path):
     return f"{st.st_size}:{int(st.st_mtime)}"
 
 
-def scene_signature(sc, base, voice, rate, res, fps, narration):
+def scene_signature(sc, base, voice, rate, res, fps, narration, loudness=None):
     bits = [narration, str(sc.get("voice", voice)), str(sc.get("rate", rate)),
-            res, str(fps), str(sc.get("duration", ""))]
+            res, str(fps), str(sc.get("duration", "")), str(loudness)]
     for key in ("clip", "image"):
         if key in sc:
             bits += [key, file_sig(resolve_path(base, sc[key]))]
@@ -604,6 +632,29 @@ def write_srt(entries, path):
     Path(path).write_text("\n".join(lines), encoding="utf-8")
 
 
+def srt_to_vtt(srt_text):
+    return "WEBVTT\n\n" + re.sub(r"(\d{2}:\d{2}:\d{2}),(\d{3})", r"\1.\2", srt_text)
+
+
+def write_transcript(title, scenes, path):
+    lines = [f"# {title}", ""] if title else []
+    for sc in scenes:
+        n = (sc.get("narration") or "").strip()
+        if n:
+            lines += [n, ""]
+    Path(path).write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
+
+
+def chapter_title(sc, i):
+    if sc.get("chapter"):
+        return str(sc["chapter"])
+    n = (sc.get("narration") or "").strip()
+    if not n:
+        return f"Scene {i + 1}"
+    first = SENT_RE.split(n)[0].strip().rstrip(".")
+    return first if len(first) <= 52 else first[:49].rsplit(" ", 1)[0] + "..."
+
+
 def load_storyboard(path):
     p = Path(path)
     if not p.exists():
@@ -629,6 +680,8 @@ def cmd_build(args):
     res = sb.get("resolution", DEFAULT_RES)
     fps = int(sb.get("fps", DEFAULT_FPS))
     captions = sb.get("captions", "none")
+    loudness = sb.get("loudness", -16)
+    rules = load_pronounce(base, sb)
     out_path = Path(args.output or sb.get("output", "demo.mp4"))
     scenes = sb.get("scenes") or []
     if not scenes:
@@ -647,6 +700,7 @@ def cmd_build(args):
     fresh, reused = {}, 0
 
     parts, subs, clock = [], [], 0.0
+    chapters = []
 
     tc = sb.get("title_card")
     if tc:
@@ -654,14 +708,16 @@ def cmd_build(args):
         p = title_card(tc.get("text", sb.get("title", "")), tc.get("subtitle"),
                        work / "scene_title.mp4", d, res, fps, work)
         if p:
-            a = norm_audio(None, work / "scene_title.m4a", d)
+            a = norm_audio(None, work / "scene_title.m4a", d, None)
             parts.append(mux(p, a, work / "scene_title_av.mp4"))
+            chapters.append({"start": 0.0, "title": tc.get("text") or sb.get("title") or "Opening"})
             clock += d
 
     for i, sc in enumerate(scenes):
         tag = f"scene_{i:02d}"
         narration = (sc.get("narration") or "").strip()
-        sig = scene_signature(sc, base, voice, rate, res, fps, narration)
+        spoken = apply_pronounce(narration, rules)
+        sig = scene_signature(sc, base, voice, rate, res, fps, spoken, loudness)
         hit = cache.get(tag)
         av_path = work / f"{tag}_av.mp4"
         if hit and hit.get("sig") == sig and av_path.exists():
@@ -669,16 +725,18 @@ def cmd_build(args):
             target, vo_dur = float(hit["target"]), float(hit["vo_dur"])
             fresh[tag] = hit
             reused += 1
+            chapters.append({"start": clock, "title": chapter_title(sc, i)})
             if narration and captions != "none":
                 subs.extend(chunk_narration(narration, clock, max(vo_dur, 0.8)))
             clock += target
             info(f"{tag}: {target:.2f}s (cached)")
             continue
 
+        chapters.append({"start": clock, "title": chapter_title(sc, i)})
         vo, vo_dur = None, 0.0
         if narration:
             vo = work / f"{tag}.aiff"
-            vo_dur = make_vo(narration, vo, sc.get("voice", voice),
+            vo_dur = make_vo(spoken, vo, sc.get("voice", voice),
                              int(sc.get("rate", rate)))
 
         kind, src = "clip", None
@@ -729,7 +787,7 @@ def cmd_build(args):
 
         target = max(vid_dur, vo_dur, MIN_SCENE)
         v = norm_video(src, work / f"{tag}_v.mp4", target, res, fps, kind, work)
-        a = norm_audio(vo, work / f"{tag}_a.m4a", target)
+        a = norm_audio(vo, work / f"{tag}_a.m4a", target, loudness)
         parts.append(mux(v, a, av_path))
         fresh[tag] = {"sig": sig, "target": target, "vo_dur": vo_dur}
 
@@ -748,6 +806,10 @@ def cmd_build(args):
     srt = out_path.with_suffix(".srt")
     if subs:
         write_srt(subs, srt)
+        vtt = out_path.with_suffix(".vtt")
+        vtt.write_text(srt_to_vtt(srt.read_text(encoding="utf-8")), encoding="utf-8")
+    write_transcript(sb.get("title"), scenes, out_path.with_suffix(".transcript.md"))
+    out_path.with_suffix(".chapters.json").write_text(json.dumps(chapters, indent=2))
 
     if captions == "burn" and subs:
         done = None
@@ -775,7 +837,8 @@ def cmd_build(args):
     size = out_path.stat().st_size / 1e6
     info(f"built {out_path} — {total:.1f}s, {size:.1f} MB, {len(scenes)} scenes")
     if subs:
-        info(f"captions: {srt}")
+        info(f"captions: {srt} (+ .vtt)")
+    info(f"transcript: {out_path.with_suffix('.transcript.md')}")
     cache_file.write_text(json.dumps(fresh, indent=2))
     if reused:
         info(f"reused {reused} cached scene(s); --no-cache forces a full rebuild")
@@ -814,7 +877,8 @@ def cmd_plan(args):
         words = len(narration.split())
         vo_dur = 0.0
         if narration:
-            vo_dur = make_vo(narration, tmp / f"{tag}.aiff",
+            vo_dur = make_vo(apply_pronounce(narration, load_pronounce(base, sb)),
+                             tmp / f"{tag}.aiff",
                              sc.get("voice", voice), int(sc.get("rate", rate)))
 
         src_dur, est = 0.0, ""
@@ -881,6 +945,171 @@ def cmd_quick(args):
                             workdir=str(work), keep=False, no_cache=True,
                             clean=False)
     cmd_build(ns)
+
+
+
+PAGE_HTML = """<title>__TITLE__</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+<style>
+  :root { color-scheme: light;
+    --bg:#f5f6f9; --surface:#fff; --ink:#171a21; --muted:#5d6577;
+    --accent:#2f5fe0; --accent-soft:#e8edfd; --rule:#e1e5ec;
+    --sans:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;
+    --mono:"IBM Plex Mono",ui-monospace,"SF Mono",Menlo,monospace; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+    color-scheme: dark; --bg:#0f1117; --surface:#171a22; --ink:#e8eaf0;
+    --muted:#98a0b2; --accent:#7fa2ff; --accent-soft:#1b2440; --rule:#252a35; } }
+  :root[data-theme="dark"] { color-scheme: dark;
+    --bg:#0f1117; --surface:#171a22; --ink:#e8eaf0; --muted:#98a0b2;
+    --accent:#7fa2ff; --accent-soft:#1b2440; --rule:#252a35; }
+  body { background:var(--bg); color:var(--ink); font-family:var(--sans);
+    font-size:16px; line-height:1.6; -webkit-font-smoothing:antialiased; }
+  .wrap { max-width:920px; margin:0 auto; padding-inline:20px;
+    padding-block:40px 72px; display:flex; flex-direction:column; gap:32px; }
+  .eyebrow { font-family:var(--mono); font-size:12px; letter-spacing:.09em;
+    text-transform:uppercase; color:var(--accent); }
+  h1 { margin:0; font-size:clamp(30px,5vw,44px); font-weight:700;
+    letter-spacing:-.025em; line-height:1.1; text-wrap:balance; }
+  .standfirst { margin:0; max-width:62ch; color:var(--muted); font-size:17px; }
+  .meta { display:flex; flex-wrap:wrap; gap:8px 18px; font-family:var(--mono);
+    font-size:13px; color:var(--muted); font-variant-numeric:tabular-nums; }
+  header { display:flex; flex-direction:column; gap:10px; }
+  .player { background:#000; border:1px solid var(--rule); border-radius:12px;
+    overflow:hidden; line-height:0; }
+  video { width:100%; max-width:100%; aspect-ratio:16/9; display:block; background:#000; }
+  h2 { margin:0 0 14px; font-size:13px; font-family:var(--mono); font-weight:500;
+    letter-spacing:.09em; text-transform:uppercase; color:var(--muted); }
+  .chapters { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:2px; }
+  @media (max-width:620px) { .chapters { grid-template-columns:1fr; } }
+  .chapter { display:flex; align-items:baseline; gap:14px; width:100%;
+    padding:10px 12px; background:transparent; border:0; border-radius:7px;
+    font:inherit; color:var(--ink); text-align:left; cursor:pointer; }
+  .chapter:hover { background:var(--surface); }
+  .chapter[aria-current="true"] { background:var(--accent-soft); color:var(--accent); }
+  .chapter:focus-visible { outline:2px solid var(--accent); outline-offset:1px; }
+  .t { font-family:var(--mono); font-size:13px; color:var(--accent);
+    font-variant-numeric:tabular-nums; flex:none; }
+  .chapter[aria-current="true"] .t { color:inherit; }
+  details { background:var(--surface); border:1px solid var(--rule);
+    border-radius:10px; padding:14px 18px; }
+  summary { cursor:pointer; font-weight:600; font-size:15px; }
+  details p { color:var(--muted); font-size:15px; white-space:pre-wrap; }
+  @media (prefers-reduced-motion: reduce) { * { transition:none !important; } }
+</style>
+<div class="wrap">
+  <header>
+    <span class="eyebrow">__EYEBROW__</span>
+    <h1>__HEADING__</h1>
+    <p class="standfirst">__DESC__</p>
+    <div class="meta">__META__</div>
+  </header>
+  <div class="player">
+    <video id="v" controls preload="metadata" poster="poster.jpg" playsinline>
+      <source src="video.mp4" type="video/mp4">
+    </video>
+  </div>
+  <section>
+    <h2>Chapters</h2>
+    <div class="chapters" id="chapters"></div>
+  </section>
+  __TRANSCRIPT__
+</div>
+<script>
+  const video = document.getElementById("v");
+  const list = document.getElementById("chapters");
+  const CHAPTERS = __CHAPTERS__;
+  const VTT = __VTT__;
+  if (VTT) {
+    // Inlined: artifacts do not serve .vtt files.
+    try {
+      const tr = document.createElement("track");
+      tr.kind = "captions"; tr.srclang = "en"; tr.label = "English";
+      tr.src = URL.createObjectURL(new Blob([VTT], { type: "text/vtt" }));
+      video.appendChild(tr);
+    } catch (e) {}
+  }
+  const fmt = (s) => Math.floor(s / 60) + ":" + String(Math.floor(s % 60)).padStart(2, "0");
+  CHAPTERS.forEach(function (c) {
+    const b = document.createElement("button");
+    b.className = "chapter"; b.type = "button";
+    b.innerHTML = '<span class="t">' + fmt(c.start) + '</span><span></span>';
+    b.lastChild.textContent = c.title;
+    b.addEventListener("click", function () {
+      video.currentTime = c.start;
+      video.play().catch(function () {});
+    });
+    list.appendChild(b);
+  });
+  const buttons = Array.prototype.slice.call(list.children);
+  video.addEventListener("timeupdate", function () {
+    let active = 0;
+    for (let i = 0; i < CHAPTERS.length; i++) {
+      if (video.currentTime >= CHAPTERS[i].start) active = i;
+    }
+    buttons.forEach(function (b, i) { b.setAttribute("aria-current", String(i === active)); });
+  });
+</script>
+"""
+
+
+def cmd_page(args):
+    """Emit a publish-ready HTML page around a built video.
+
+    Chapters, captions and the transcript already exist as build sidecars, so
+    the page is assembled rather than hand-written.
+    """
+    need_ffmpeg()
+    video = Path(args.video)
+    if not video.exists():
+        die(f"video not found: {video}")
+    out_dir = Path(args.out_dir or video.parent / "page")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    dur = probe_duration(video)
+    chap_file = video.with_suffix(".chapters.json")
+    chapters = []
+    if chap_file.exists():
+        chapters = json.loads(chap_file.read_text())
+    else:
+        info("no .chapters.json beside the video; the page will have no chapters")
+
+    vtt_file = video.with_suffix(".vtt")
+    vtt = vtt_file.read_text(encoding="utf-8") if vtt_file.exists() else ""
+
+    tr_file = video.with_suffix(".transcript.md")
+    transcript = ""
+    if tr_file.exists() and not args.no_transcript:
+        body = tr_file.read_text(encoding="utf-8")
+        body = "\n".join(l for l in body.splitlines() if not l.startswith("# "))
+        transcript = ("<section><details><summary>Full narration</summary><p>"
+                      + body.strip().replace("&", "&amp;").replace("<", "&lt;")
+                      + "</p></details></section>")
+
+    shutil.copyfile(video, out_dir / "video.mp4")
+    poster = out_dir / "poster.jpg"
+    run([FFMPEG, "-y", "-ss", f"{min(1.6, dur / 2):.2f}", "-i", str(video),
+         "-frames:v", "1", "-vf", "scale=1280:-1", "-q:v", "4", str(poster)])
+
+    mins, secs = divmod(dur, 60)
+    meta = f"<span>{int(mins)} min {int(secs):02d} s</span>"
+    if args.meta:
+        meta += "".join(f"<span>{m.strip()}</span>" for m in args.meta.split("|"))
+
+    title = args.title or video.stem.replace("-", " ").replace("_", " ").title()
+    html = (PAGE_HTML
+            .replace("__TITLE__", title)
+            .replace("__EYEBROW__", args.eyebrow or "Walkthrough")
+            .replace("__HEADING__", args.heading or title)
+            .replace("__DESC__", args.description or "")
+            .replace("__META__", meta)
+            .replace("__TRANSCRIPT__", transcript)
+            .replace("__CHAPTERS__", json.dumps(chapters))
+            .replace("__VTT__", json.dumps(vtt)))
+    (out_dir / "index.html").write_text(html, encoding="utf-8")
+
+    info(f"page: {out_dir}/index.html  (+ video.mp4, poster.jpg)")
+    info(f"{len(chapters)} chapters, captions {'inlined' if vtt else 'absent'}")
+    info("publish it with the Artifact tool, passing video.mp4 and poster.jpg as files")
 
 
 def cmd_check(args):
@@ -995,6 +1224,17 @@ def main():
     p = sub.add_parser("plan", help="preview scene timing without building")
     p.add_argument("storyboard")
     p.set_defaults(func=cmd_plan)
+
+    p = sub.add_parser("page", help="build a publish-ready HTML page around a video")
+    p.add_argument("video")
+    p.add_argument("--out-dir", dest="out_dir")
+    p.add_argument("--title")
+    p.add_argument("--heading")
+    p.add_argument("--eyebrow")
+    p.add_argument("--description", default="")
+    p.add_argument("--meta", help="extra pipe-separated facts, e.g. 'A2UI v0.9.1|alpha01'")
+    p.add_argument("--no-transcript", action="store_true", dest="no_transcript")
+    p.set_defaults(func=cmd_page)
 
     p = sub.add_parser("quick", help="one screen recording + one narration")
     p.add_argument("--narration", required=True)
