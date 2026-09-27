@@ -9,12 +9,14 @@ concatenation, which is what makes the concat demuxer safe here.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import shutil
 import signal
 import subprocess
+import tempfile
 import sys
 import time
 from pathlib import Path
@@ -262,6 +264,78 @@ def state_dir(base="."):
     return d
 
 
+WINDOW_AS = """
+tell application "System Events"
+  set out to ""
+  repeat with pr in (every process whose visible is true)
+    try
+      tell pr
+        repeat with w in windows
+          set wn to name of w
+          if wn is not missing value then
+            if wn contains "%s" or (name of pr) contains "%s" then
+              set pp to position of w
+              set ss to size of w
+              set x to (item 1 of pp) as integer
+              set y to (item 2 of pp) as integer
+              set ww to (item 1 of ss) as integer
+              set hh to (item 2 of ss) as integer
+              if ww > 0 and hh > 0 then
+                return (x as text) & "," & (y as text) & "," & (ww as text) & "," & (hh as text)
+              end if
+            end if
+          end if
+        end repeat
+      end tell
+    end try
+  end repeat
+  return out
+end tell
+"""
+
+
+def window_region(match):
+    """Resolve a window title (or app name) substring to x,y,w,h."""
+    script = WINDOW_AS % (match, match)
+    out = subprocess.run(["osascript", "-e", script],
+                         capture_output=True, text=True).stdout.strip()
+    if not out:
+        die(f"no visible window matching {match!r}. The app may be running with "
+            "no open window, or minimised. Titles match as substrings.")
+    return parse_region(out)
+
+
+def parse_region(region):
+    """Validate x,y,w,h. An empty or malformed region must never silently
+    fall back to recording the whole screen."""
+    if region is None:
+        return None
+    r = str(region).strip()
+    if not r:
+        die("--region was empty. Pass x,y,width,height, use --window NAME, or "
+            "omit both to record the full screen deliberately.")
+    parts = r.split(",")
+    if len(parts) != 4:
+        die(f"--region must be x,y,width,height (got {r!r})")
+    try:
+        x, y, w, h = (int(float(v.strip())) for v in parts)
+    except ValueError:
+        die(f"--region values must be numbers (got {r!r})")
+    if w <= 0 or h <= 0:
+        die(f"--region width and height must be positive (got {w}x{h})")
+    return f"{x},{y},{w},{h}"
+
+
+def resolve_region(args):
+    """--window wins over --region; neither means full screen."""
+    win = getattr(args, "window", None)
+    if win:
+        reg = window_region(win)
+        info(f"window {win!r} -> region {reg}")
+        return reg
+    return parse_region(getattr(args, "region", None))
+
+
 def screen_cmd(out, display=None, region=None, cursor=True):
     cmd = [SCREENCAPTURE, "-v", "-x"]
     if cursor:
@@ -269,7 +343,7 @@ def screen_cmd(out, display=None, region=None, cursor=True):
     if display:
         cmd += ["-D", str(display)]
     if region:
-        cmd += ["-R", region]
+        cmd += ["-R", parse_region(region)]
     cmd.append(str(out))
     return cmd
 
@@ -283,7 +357,7 @@ def cmd_record_start(args):
     out.parent.mkdir(parents=True, exist_ok=True)
     if out.exists():
         out.unlink()
-    proc = subprocess.Popen(screen_cmd(out, args.display, args.region),
+    proc = subprocess.Popen(screen_cmd(out, args.display, resolve_region(args)),
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     pidfile.write_text(json.dumps({"pid": proc.pid, "out": str(out)}))
     time.sleep(1.5)  # let the capture actually start before actions begin
@@ -323,7 +397,7 @@ def cmd_record_screen(args):
     out.parent.mkdir(parents=True, exist_ok=True)
     if out.exists():
         out.unlink()
-    cmd = screen_cmd(out, args.display, args.region)
+    cmd = screen_cmd(out, args.display, resolve_region(args))
     cmd.insert(2, "-V")
     cmd.insert(3, str(args.duration))
     info(f"recording {args.duration}s -> {out}")
@@ -421,6 +495,100 @@ def title_card(text, subtitle, dst, target, res, fps, work):
     return norm_video(None, dst, target, res, fps, "pause", work)
 
 
+SENT_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def chunk_narration(text, start, total, max_chars=90):
+    """Split narration into caption-sized pieces, timed proportionally.
+
+    One caption per scene turns a 70-word scene into an unreadable block, so
+    split on sentences and share the scene's audio duration by length.
+    """
+    sents = [x.strip() for x in SENT_RE.split(text.strip()) if x.strip()]
+    if not sents:
+        return []
+    merged = []
+    for sent in sents:
+        if merged and len(merged[-1]) + len(sent) + 1 <= max_chars:
+            merged[-1] += " " + sent
+        else:
+            merged.append(sent)
+    out = []
+    for m in merged:
+        if len(m) <= max_chars * 1.6:
+            out.append(m)
+            continue
+        buf = ""
+        for piece in re.split(r",\s+", m):
+            cand = f"{buf}, {piece}" if buf else piece
+            if len(cand) > max_chars and buf:
+                out.append(buf)
+                buf = piece
+            else:
+                buf = cand
+        if buf:
+            out.append(buf)
+    span = sum(len(x) for x in out) or 1
+    entries, t = [], start
+    for x in out:
+        d = total * (len(x) / span)
+        entries.append((t, t + d, x))
+        t += d
+    return entries
+
+
+def estimate_tape_duration(tape_path):
+    """Rough VHS tape length from its Sleep/Type directives, for planning."""
+    typing, total = 0.05, 0.0
+    for line in Path(tape_path).read_text().splitlines():
+        ls = line.strip()
+        m = re.match(r"Set\s+TypingSpeed\s+([\d.]+)(ms|s)", ls)
+        if m:
+            typing = float(m.group(1)) / (1000 if m.group(2) == "ms" else 1)
+            continue
+        m = re.match(r"Sleep\s+([\d.]+)(ms|s)?", ls)
+        if m:
+            total += float(m.group(1)) / (1000 if m.group(2) == "ms" else 1)
+            continue
+        m = re.match(r'Type\s+"(.*)"', ls)
+        if m:
+            total += len(m.group(1)) * typing
+            continue
+        if re.match(r"(Enter|Backspace|Tab|Ctrl\+|Down|Up|Left|Right)", ls):
+            total += 0.1
+    return total
+
+
+def resolve_path(base, value):
+    q = Path(value)
+    return q if q.is_absolute() else base / q
+
+
+def file_sig(path):
+    q = Path(path)
+    if not q.exists():
+        return "missing"
+    st = q.stat()
+    if st.st_size <= 200_000:
+        return hashlib.sha256(q.read_bytes()).hexdigest()[:16]
+    return f"{st.st_size}:{int(st.st_mtime)}"
+
+
+def scene_signature(sc, base, voice, rate, res, fps, narration):
+    bits = [narration, str(sc.get("voice", voice)), str(sc.get("rate", rate)),
+            res, str(fps), str(sc.get("duration", ""))]
+    for key in ("clip", "image"):
+        if key in sc:
+            bits += [key, file_sig(resolve_path(base, sc[key]))]
+    if "terminal" in sc:
+        bits += ["terminal", file_sig(resolve_path(base, sc["terminal"]["tape"]))]
+    if "pause" in sc:
+        bits += ["pause", str(sc["pause"])]
+    if "screen" in sc:
+        bits += ["screen", json.dumps(sc["screen"], sort_keys=True)]
+    return hashlib.sha256("|".join(bits).encode()).hexdigest()[:20]
+
+
 def srt_time(t):
     ms = int(round(t * 1000))
     h, ms = divmod(ms, 3600000)
@@ -469,6 +637,15 @@ def cmd_build(args):
     work = Path(args.workdir) if args.workdir else base / ".demo-video" / "build"
     work.mkdir(parents=True, exist_ok=True)
 
+    cache_file = work / "cache.json"
+    cache = {}
+    if cache_file.exists() and not getattr(args, "no_cache", False):
+        try:
+            cache = json.loads(cache_file.read_text())
+        except ValueError:
+            cache = {}
+    fresh, reused = {}, 0
+
     parts, subs, clock = [], [], 0.0
 
     tc = sb.get("title_card")
@@ -484,6 +661,20 @@ def cmd_build(args):
     for i, sc in enumerate(scenes):
         tag = f"scene_{i:02d}"
         narration = (sc.get("narration") or "").strip()
+        sig = scene_signature(sc, base, voice, rate, res, fps, narration)
+        hit = cache.get(tag)
+        av_path = work / f"{tag}_av.mp4"
+        if hit and hit.get("sig") == sig and av_path.exists():
+            parts.append(av_path)
+            target, vo_dur = float(hit["target"]), float(hit["vo_dur"])
+            fresh[tag] = hit
+            reused += 1
+            if narration and captions != "none":
+                subs.extend(chunk_narration(narration, clock, max(vo_dur, 0.8)))
+            clock += target
+            info(f"{tag}: {target:.2f}s (cached)")
+            continue
+
         vo, vo_dur = None, 0.0
         if narration:
             vo = work / f"{tag}.aiff"
@@ -515,7 +706,9 @@ def cmd_build(args):
             for n in range(int(s.get("countdown", 3)), 0, -1):
                 info(f"  starting in {n}...")
                 time.sleep(1)
-            cmd = screen_cmd(src, s.get("display"), s.get("region"))
+            cmd = screen_cmd(src, s.get("display"),
+                             window_region(s["window"]) if s.get("window")
+                             else parse_region(s.get("region")))
             cmd.insert(2, "-V")
             cmd.insert(3, f"{dur:.0f}")
             run(cmd)
@@ -537,10 +730,11 @@ def cmd_build(args):
         target = max(vid_dur, vo_dur, MIN_SCENE)
         v = norm_video(src, work / f"{tag}_v.mp4", target, res, fps, kind, work)
         a = norm_audio(vo, work / f"{tag}_a.m4a", target)
-        parts.append(mux(v, a, work / f"{tag}_av.mp4"))
+        parts.append(mux(v, a, av_path))
+        fresh[tag] = {"sig": sig, "target": target, "vo_dur": vo_dur}
 
         if narration and captions != "none":
-            subs.append((clock, clock + max(vo_dur, 0.8), narration))
+            subs.extend(chunk_narration(narration, clock, max(vo_dur, 0.8)))
         clock += target
         info(f"{tag}: {target:.2f}s{' (narrated)' if narration else ''}")
 
@@ -557,7 +751,7 @@ def cmd_build(args):
 
     if captions == "burn" and subs:
         done = None
-        if len(subs) <= 40:
+        if len(subs) <= 120:
             done = burn_captions(joined, subs, out_path, res, fps, work)
         if not done and has_filter("subtitles"):
             run([FFMPEG, "-y", "-i", str(joined),
@@ -582,9 +776,86 @@ def cmd_build(args):
     info(f"built {out_path} — {total:.1f}s, {size:.1f} MB, {len(scenes)} scenes")
     if subs:
         info(f"captions: {srt}")
-    if not args.keep:
+    cache_file.write_text(json.dumps(fresh, indent=2))
+    if reused:
+        info(f"reused {reused} cached scene(s); --no-cache forces a full rebuild")
+    if getattr(args, "clean", False):
         for f in work.glob("scene_*"):
             f.unlink(missing_ok=True)
+        cache_file.unlink(missing_ok=True)
+
+
+def cmd_plan(args):
+    """Render only the voiceovers and report how each scene will fit.
+
+    Run this BEFORE recording: it tells you how long each capture needs to be,
+    instead of discovering a 10-second frozen frame after the fact.
+    """
+    sb = load_storyboard(args.storyboard)
+    base = Path(args.storyboard).parent
+    voice = sb.get("voice", DEFAULT_VOICE)
+    rate = int(sb.get("rate", DEFAULT_RATE))
+    scenes = sb.get("scenes") or []
+    if not scenes:
+        die("storyboard has no scenes")
+
+    tmp = Path(tempfile.mkdtemp(prefix="demo-video-plan-"))
+    total, warnings = 0.0, 0
+
+    tc = sb.get("title_card")
+    if tc:
+        total += float(tc.get("duration", 2.5))
+
+    print(f"{'scene':<9} {'words':>5} {'voice':>8} {'source':>9} {'scene':>8}  note")
+    print("-" * 68)
+    for i, sc in enumerate(scenes):
+        tag = f"scene_{i:02d}"
+        narration = (sc.get("narration") or "").strip()
+        words = len(narration.split())
+        vo_dur = 0.0
+        if narration:
+            vo_dur = make_vo(narration, tmp / f"{tag}.aiff",
+                             sc.get("voice", voice), int(sc.get("rate", rate)))
+
+        src_dur, est = 0.0, ""
+        if "clip" in sc:
+            src = resolve_path(base, sc["clip"])
+            src_dur = probe_duration(src) if src.exists() else 0.0
+            if not src.exists():
+                est = "clip MISSING"
+        elif "image" in sc:
+            src_dur = float(sc.get("duration", 0))
+        elif "pause" in sc:
+            src_dur = float(sc.get("pause") or 0)
+        elif "screen" in sc:
+            src_dur = float(sc["screen"].get("duration", 0))
+        elif "terminal" in sc:
+            tape = resolve_path(base, sc["terminal"]["tape"])
+            src_dur = estimate_tape_duration(tape) if tape.exists() else 0.0
+            est = "~est"
+            if not tape.exists():
+                est = "tape MISSING"
+
+        target = max(src_dur, vo_dur, MIN_SCENE)
+        note = est
+        if src_dur and vo_dur > src_dur + 3:
+            note = (note + " " if note else "") + f"FREEZE {vo_dur - src_dur:.1f}s"
+            warnings += 1
+        elif vo_dur and src_dur > vo_dur + 4:
+            note = (note + " " if note else "") + f"silence {src_dur - vo_dur:.1f}s"
+        total += target
+        print(f"{tag:<9} {words:>5} {vo_dur:>7.1f}s {src_dur:>8.1f}s {target:>7.1f}s  {note}")
+
+    print("-" * 68)
+    mins, secs = divmod(total, 60)
+    print(f"total {int(mins)}m {secs:04.1f}s across {len(scenes)} scenes"
+          + (f" (+ title card)" if tc else ""))
+    if warnings:
+        print(f"\n{warnings} scene(s) will hold a frozen frame for 3s or more.")
+        print("Record longer, raise the VHS `Sleep`, or shorten the narration.")
+    else:
+        print("\nEvery scene fits its narration.")
+    shutil.rmtree(tmp, ignore_errors=True)
 
 
 def cmd_quick(args):
@@ -596,7 +867,7 @@ def cmd_quick(args):
     for n in range(3, 0, -1):
         info(f"  starting in {n}...")
         time.sleep(1)
-    cmd = screen_cmd(clip, args.display, args.region)
+    cmd = screen_cmd(clip, args.display, resolve_region(args))
     cmd.insert(2, "-V")
     cmd.insert(3, str(args.duration))
     run(cmd)
@@ -607,7 +878,8 @@ def cmd_quick(args):
     sbp = work / "storyboard.json"
     sbp.write_text(json.dumps(sb, indent=2))
     ns = argparse.Namespace(storyboard=str(sbp), output=args.out,
-                            workdir=str(work), keep=False)
+                            workdir=str(work), keep=False, no_cache=True,
+                            clean=False)
     cmd_build(ns)
 
 
@@ -689,6 +961,7 @@ def main():
     q.add_argument("--out", required=True)
     q.add_argument("--display", type=int)
     q.add_argument("--region", help="x,y,width,height")
+    q.add_argument("--window", help="window title or app name substring; resolves the region for you")
     q.set_defaults(func=cmd_record_start)
 
     q = rsub.add_parser("stop", help="stop the in-progress recording")
@@ -699,6 +972,7 @@ def main():
     q.add_argument("--duration", type=float, required=True)
     q.add_argument("--display", type=int)
     q.add_argument("--region", help="x,y,width,height")
+    q.add_argument("--window", help="window title or app name substring; resolves the region for you")
     q.set_defaults(func=cmd_record_screen)
 
     q = rsub.add_parser("terminal", help="render a VHS tape to video")
@@ -710,8 +984,17 @@ def main():
     p.add_argument("storyboard")
     p.add_argument("--output")
     p.add_argument("--workdir")
-    p.add_argument("--keep", action="store_true", help="keep intermediate scene files")
+    p.add_argument("--keep", action="store_true",
+                   help="deprecated; scene files are kept by default for caching")
+    p.add_argument("--no-cache", action="store_true", dest="no_cache",
+                   help="re-render every scene even if unchanged")
+    p.add_argument("--clean", action="store_true",
+                   help="delete intermediates and the cache after building")
     p.set_defaults(func=cmd_build)
+
+    p = sub.add_parser("plan", help="preview scene timing without building")
+    p.add_argument("storyboard")
+    p.set_defaults(func=cmd_plan)
 
     p = sub.add_parser("quick", help="one screen recording + one narration")
     p.add_argument("--narration", required=True)
@@ -719,6 +1002,7 @@ def main():
     p.add_argument("--out", default="demo.mp4")
     p.add_argument("--display", type=int)
     p.add_argument("--region")
+    p.add_argument("--window", help="window title or app name substring")
     p.add_argument("--voice", default=DEFAULT_VOICE)
     p.add_argument("--rate", type=int, default=DEFAULT_RATE)
     p.set_defaults(func=cmd_quick)

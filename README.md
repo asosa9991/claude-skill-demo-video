@@ -37,10 +37,14 @@ Record while you drive the app:
 ```bash
 SCRIPT=~/.claude/skills/demo-video/scripts/demo_video.py
 
-python3 $SCRIPT record start --out app.mov --region 100,100,353,813
+python3 $SCRIPT record start --out app.mov --window "Android Emulator"
 # ...click, type, scroll — whatever the demo shows...
 python3 $SCRIPT record stop
 ```
+
+`--window` matches window titles and app names as substrings and resolves the
+capture rectangle for you. An empty or malformed `--region` is rejected rather
+than silently recording your whole desktop.
 
 Describe it:
 
@@ -57,11 +61,29 @@ Describe it:
 }
 ```
 
+Check the timing before you record:
+
+```bash
+python3 $SCRIPT plan storyboard.json
+```
+
+```
+scene     words    voice    source    scene  note
+scene_00     74    26.7s     23.6s    26.7s  FREEZE 3.1s
+scene_01     84    26.5s     20.3s    26.5s  ~est FREEZE 6.1s
+```
+
+`plan` renders only the voiceovers and flags any scene whose narration outruns
+its footage, so you size captures correctly the first time.
+
 Build it:
 
 ```bash
 python3 $SCRIPT build storyboard.json
 ```
+
+Scenes are **cached** by content — change one line of narration and only that
+scene re-renders, instead of re-rendering every VHS tape in real time.
 
 Or one-shot, no storyboard:
 

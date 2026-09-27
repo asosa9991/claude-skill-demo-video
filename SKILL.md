@@ -53,15 +53,16 @@ Fixed-length, unattended:
 python3 $SCRIPT record screen --out app.mov --duration 12 --region x,y,w,h
 ```
 
-Get a window's rectangle so you capture it and nothing else:
+Capture one window by name — no AppleScript needed:
 
 ```bash
-osascript -e 'tell application "System Events" to tell process "PROCNAME"
-  repeat with w in windows
-    return "" & (item 1 of position of w) & "," & (item 2 of position of w) & "," & (item 1 of size of w) & "," & (item 2 of size of w)
-  end repeat
-end tell'
+python3 $SCRIPT record start --out app.mov --window "Android Emulator"
 ```
+
+`--window` matches window titles and app names as substrings, and prints the
+region it resolved. An empty or malformed `--region` is rejected rather than
+silently falling back to full-screen capture. Omit both only when you really do
+want the whole desktop.
 
 Bring the target window to the front first, or you will record whatever covers it.
 
@@ -89,7 +90,26 @@ JSON (or YAML if PyYAML is installed). One scene per idea:
 Scene sources: `clip` (pre-recorded), `screen` (records during build), `terminal`
 (a VHS tape), `image`, `pause`. See `reference/storyboard.md` for every field.
 
-### 4. Build
+### 4. Check the timing before you record
+
+```bash
+python3 $SCRIPT plan storyboard.json
+```
+
+Renders only the voiceovers and reports, per scene, how long the narration runs
+against the source you have. It flags any scene that will hold a frozen frame
+for 3s or more — so you size the capture correctly the first time instead of
+discovering the mismatch afterwards.
+
+```
+scene     words    voice    source    scene  note
+scene_00     74    26.7s     23.6s    26.7s  FREEZE 3.1s
+scene_01     84    26.5s     20.3s    26.5s  ~est FREEZE 6.1s
+```
+
+Terminal scenes are estimated from the tape's `Sleep`/`Type` directives (`~est`).
+
+### 5. Build
 
 ```bash
 python3 $SCRIPT build storyboard.json
@@ -97,6 +117,11 @@ python3 $SCRIPT build storyboard.json
 
 Per scene it renders the narration, fits the picture to it, and normalises
 everything to one codec/resolution/fps before concatenating.
+
+**Scenes are cached.** A scene is re-rendered only when its narration, voice,
+rate, source file or resolution changes, so editing one line of narration
+rebuilds in seconds instead of re-rendering every VHS tape in real time. Use
+`--no-cache` to force a full rebuild, `--clean` to discard intermediates.
 
 ## Writing narration that lands
 
@@ -135,8 +160,9 @@ Accessibility > Spoken Content > System Voice > Manage Voices. Set per storyboar
   `mov_text` track.
 - `"burn"` — permanently drawn on. Rendered as PNG overlays via headless Chrome,
   because Homebrew's ffmpeg ships **without** `drawtext` and `libass`.
-- **Known limitation:** one caption per scene, so a 70-word scene becomes one
-  large text block. For readable burned-in captions, split into shorter scenes.
+Narration is split into caption-sized chunks on sentence boundaries, timed
+proportionally, so a long scene produces several readable captions rather than
+one block.
 
 ## Terminal scenes (VHS)
 
@@ -168,7 +194,8 @@ python3 $SCRIPT quick --narration "Here is the new dashboard." --duration 15 --o
 | `screencapture exited immediately` | Screen Recording permission not granted to the terminal |
 | Recording is black or shows the wrong app | Target window was not frontmost, or wrong `--region` |
 | `No such filter: 'drawtext'` | Expected — the skill renders text via headless Chrome instead |
-| Long frozen frames | Narration outran the capture; lengthen the clip or VHS `Sleep` |
+| Long frozen frames | Narration outran the capture; run `plan` first, then lengthen the clip or VHS `Sleep` |
+| `--region was empty` | Guard against silently recording the whole desktop; use `--window NAME` |
 | Robotic name pronunciation | Spell identifiers phonetically in the narration |
 
 A worked example lives in `reference/example-android-demo.md`.
