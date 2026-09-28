@@ -32,88 +32,61 @@ System Audio Recording, then restart the terminal.
 
 ## Quick start
 
-Record while you drive the app:
+Write a markdown script:
 
-```bash
-SCRIPT=~/.claude/skills/demo-video/scripts/demo_video.py
+```markdown
+---
+output: demo.mp4
+voice: Zoe (Premium)
+resolution: 1920x1080
+---
 
-python3 $SCRIPT record start --out app.mov --window "Android Emulator"
-# ...click, type, scroll — whatever the demo shows...
-python3 $SCRIPT record stop
+# My Feature
+> What changed and why
+
+## What this covers
+@card 1 | Setup | Two commands and one trap
+Narration as ordinary prose. Write as much as the scene needs —
+the picture is sized to fit it automatically.
+
+## The dependencies
+@run sed -n '/^dependencies/,/^}/p' app/build.gradle.kts
+Five artifacts, and the third is the one people miss.
+
+## It running
+@clip app.mov 4-22
+Here it is on a device.
 ```
-
-`--window` matches window titles and app names as substrings and resolves the
-capture rectangle for you. An empty or malformed `--region` is rejected rather
-than silently recording your whole desktop.
-
-Describe it:
-
-```json
-{
-  "output": "demo.mp4",
-  "voice": "Zoe (Premium)",
-  "resolution": "1920x1080",
-  "title_card": { "text": "My Feature", "duration": 3.0 },
-  "scenes": [
-    { "narration": "Here is the new screen.", "clip": "app.mov" },
-    { "narration": "And this is how it is wired up.", "terminal": { "tape": "code.tape" } }
-  ]
-}
-```
-
-Check the timing before you record:
-
-```bash
-python3 $SCRIPT plan storyboard.json
-```
-
-```
-scene     words    voice    source    scene  note
-scene_00     74    26.7s     23.6s    26.7s  FREEZE 3.1s
-scene_01     84    26.5s     20.3s    26.5s  ~est FREEZE 6.1s
-```
-
-`plan` renders only the voiceovers and flags any scene whose narration outruns
-its footage, so you size captures correctly the first time.
 
 Build it:
 
 ```bash
-python3 $SCRIPT build storyboard.json
+python3 ~/.claude/skills/demo-video/scripts/demo_video.py build demo.md
 ```
 
-Scenes are **cached** by content — change one line of narration and only that
-scene re-renders, instead of re-rendering every VHS tape in real time.
+**You never set a duration.** Terminal scenes are generated *after* the
+narration is measured, so they always fit. Clips hold their last frame if the
+narration runs long, and get padded with silence if it runs short.
 
-Each build also writes a `.srt`, a `.vtt`, a `.transcript.md` and a
-`.chapters.json` beside the mp4, and normalises the voiceover to a consistent
-loudness.
-
-Then ship it as a page:
+Capture an app first if you need one:
 
 ```bash
-python3 $SCRIPT page demo.mp4 --title "My Feature" --meta "v0.9.1"
-```
-
-That builds `page/index.html` — the video, clickable chapters that seek it,
-inlined captions, a poster frame and a collapsible transcript — ready to publish
-or host.
-
-Or one-shot, no storyboard:
-
-```bash
-python3 $SCRIPT quick --narration "Here is the dashboard." --duration 15 --out demo.mp4
+python3 $SCRIPT record start --out app.mov --window "My App"
+# ...drive the app...
+python3 $SCRIPT record stop
 ```
 
 ## Scene types
 
-| Source | Use for |
+| Directive | Renders |
 | --- | --- |
-| `clip` | A screen recording you already captured |
-| `screen` | Records during the build, with a countdown |
-| `terminal` | A VHS tape — sharper than screen-recording a terminal |
-| `image` | A still, e.g. an architecture diagram |
-| `pause` | A beat of black |
+| `@card N \| Title \| Subtitle` | A numbered section card |
+| `@run <command>` | A terminal scene, sized to the narration |
+| `@clip file [from-to]` | Video, optionally trimmed to those seconds |
+| `@image file [seconds]` | A still |
+| `@pause 2` | A beat of black |
+
+JSON and YAML storyboards still work and take the same fields.
 
 Scene length is `max(clip, narration, 1.5s)`. Narration longer than the clip
 freezes the last frame; a clip longer than the narration gets padded with silence.

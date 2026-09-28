@@ -541,6 +541,10 @@ def chunk_narration(text, start, total, max_chars=90):
     return entries
 
 
+def _typing_estimate(command):
+    return len(command) * 0.026 + 1.0
+
+
 def estimate_tape_duration(tape_path):
     """Rough VHS tape length from its Sleep/Type directives, for planning."""
     typing, total = 0.05, 0.0
@@ -609,7 +613,15 @@ def scene_signature(sc, base, voice, rate, res, fps, narration, loudness=None):
         if key in sc:
             bits += [key, file_sig(resolve_path(base, sc[key]))]
     if "terminal" in sc:
-        bits += ["terminal", file_sig(resolve_path(base, sc["terminal"]["tape"]))]
+        t = sc["terminal"]
+        if t.get("run"):
+            bits += ["run", t["run"]]
+        else:
+            bits += ["terminal", file_sig(resolve_path(base, t["tape"]))]
+    if "card" in sc:
+        bits += ["card", json.dumps(sc["card"], sort_keys=True)]
+    if "from" in sc or "to" in sc:
+        bits += ["trim", str(sc.get("from")), str(sc.get("to"))]
     if "pause" in sc:
         bits += ["pause", str(sc["pause"])]
     if "screen" in sc:
@@ -655,10 +667,160 @@ def chapter_title(sc, i):
     return first if len(first) <= 52 else first[:49].rsplit(" ", 1)[0] + "..."
 
 
+SCRIPT_HELP = """A script is markdown. Front matter sets the defaults, each
+`## ` heading starts a scene, one @directive picks what is on screen, and the
+prose under it is the narration."""
+
+
+def _front_matter(text):
+    meta, body = {}, text
+    if text.startswith("---"):
+        end = text.find("\n---", 3)
+        if end != -1:
+            for line in text[3:end].strip().splitlines():
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    meta[k.strip()] = v.strip()
+            body = text[end + 4:]
+    for k in ("rate", "fps"):
+        if k in meta:
+            meta[k] = int(meta[k])
+    if "loudness" in meta:
+        meta["loudness"] = None if meta["loudness"] == "none" else int(meta["loudness"])
+    return meta, body
+
+
+DIRECTIVE = re.compile(r"^@(card|run|clip|image|pause)\s*(.*)$", re.I)
+
+
+def parse_script(path):
+    """Markdown -> storyboard. Narration is prose, not a JSON string."""
+    text = Path(path).read_text(encoding="utf-8")
+    meta, body = _front_matter(text)
+    sb = {"scenes": []}
+    sb.update(meta)
+
+    title_text = None
+    chunks = re.split(r"^##\s+", body, flags=re.M)
+    head = chunks[0]
+    m = re.search(r"^#\s+(.+)$", head, flags=re.M)
+    if m:
+        title_text = m.group(1).strip()
+    sub = re.search(r"^>\s*(.+)$", head, flags=re.M)
+    if title_text:
+        sb.setdefault("title", title_text)
+        sb["title_card"] = {"text": title_text, "duration": float(meta.get("title_seconds", 4.0))}
+        if sub:
+            sb["title_card"]["subtitle"] = sub.group(1).strip()
+
+    for chunk in chunks[1:]:
+        lines = chunk.splitlines()
+        chapter = lines[0].strip()
+        scene = {"chapter": chapter}
+        narration = []
+        for line in lines[1:]:
+            d = DIRECTIVE.match(line.strip())
+            if d:
+                kind, arg = d.group(1).lower(), d.group(2).strip()
+                if kind == "card":
+                    parts = [x.strip() for x in arg.split("|")]
+                    scene["card"] = {"number": parts[0] if len(parts) > 1 else "",
+                                     "title": parts[1] if len(parts) > 1 else parts[0],
+                                     "subtitle": parts[2] if len(parts) > 2 else ""}
+                elif kind == "run":
+                    scene["terminal"] = {"run": arg}
+                elif kind == "clip":
+                    bits = arg.split()
+                    scene["clip"] = bits[0]
+                    if len(bits) > 1 and "-" in bits[1]:
+                        a, b = bits[1].split("-", 1)
+                        scene["from"] = float(a)
+                        scene["to"] = float(b)
+                elif kind == "image":
+                    bits = arg.split()
+                    scene["image"] = bits[0]
+                    if len(bits) > 1:
+                        scene["duration"] = float(bits[1])
+                elif kind == "pause":
+                    scene["pause"] = float(arg or 1.5)
+            elif line.strip():
+                narration.append(line.strip())
+        scene["narration"] = " ".join(narration)
+        sb["scenes"].append(scene)
+    return sb
+
+
+CARD_HTML = """<html><body style="margin:0;width:{w}px;height:{h}px;background:{bg};
+display:flex;flex-direction:column;align-items:center;justify-content:center;font-family:{sans};">
+{num}<div style="color:#fff;font-size:{fs}px;font-weight:600;letter-spacing:-0.02em;
+text-align:center;max-width:84%;line-height:1.12;">{title}</div>{sub}</body></html>"""
+
+
+def render_card(card, out, res):
+    """A numbered section card, so nobody hand-writes HTML for these again."""
+    w, h = (int(x) for x in res.split("x"))
+    num = ""
+    if str(card.get("number", "")).strip():
+        num = (f'<div style="color:#5b8cff;font-size:{int(h * 0.125)}px;font-weight:700;'
+               f'line-height:1;">{esc(str(card["number"]))}</div>')
+    sub = ""
+    if card.get("subtitle"):
+        sub = (f'<div style="color:#8b93a7;font-size:{max(18, int(h * 0.029))}px;'
+               f'margin-top:{int(h * 0.017)}px;text-align:center;max-width:74%;">'
+               f'{esc(card["subtitle"])}</div>')
+    html = CARD_HTML.format(w=w, h=h, bg="#0f1117", sans=SANS,
+                            fs=max(28, int(h * 0.062)), title=esc(card.get("title", "")),
+                            num=num, sub=sub)
+    return render_html_png(html, out, w, h)
+
+
+def write_tape(command, out_tape, seconds, res):
+    """Generate a VHS tape sized to the narration -- no Sleep to guess."""
+    w, h = (int(x) for x in res.split("x"))
+    tw = min(1600, int(w * 0.83)) // 2 * 2
+    th = min(900, int(h * 0.82)) // 2 * 2
+    # VHS has no escape inside Type, so pick the quote style the command allows.
+    shown = command
+    if '"' not in command:
+        typed = f'Type "{command}"'
+    elif "'" not in command:
+        typed = f"Type '{command}'"
+    else:
+        # both quote styles present: run it from a file rather than fail
+        sh = Path(out_tape).with_suffix(".sh")
+        sh.write_text(command + "\n", encoding="utf-8")
+        shown = f"sh {sh.name}"
+        typed = f'Type "{shown}"'
+        info(f"command mixes ' and \" so the tape runs it from {sh.name}; "
+             "simplify the quoting if you want it shown verbatim")
+    Path(out_tape).write_text(
+        f'Set FontSize 17\nSet Width {tw}\nSet Height {th}\nSet Padding 26\n'
+        f'Set Theme "Dracula"\nSet TypingSpeed 26ms\n'
+        f'{typed}\nSleep 400ms\nEnter\nSleep {seconds:.0f}s\n',
+        encoding="utf-8")
+    return out_tape
+
+
+def trim_clip(src, dst, start, end, fps=30):
+    """Trim to an exact length.
+
+    adb screenrecord (and most screen capture) is variable frame rate, where
+    -t works off timestamps and silently overshoots. Forcing a constant rate
+    makes the requested duration the duration you get.
+    """
+    need_ffmpeg()
+    run([FFMPEG, "-y", "-i", str(src), "-ss", f"{start:.2f}", "-t", f"{end - start:.2f}",
+         "-vf", f"fps={fps}", "-fps_mode", "cfr",
+         "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-an", str(dst)])
+    return dst
+
+
 def load_storyboard(path):
     p = Path(path)
     if not p.exists():
         die(f"storyboard not found: {p}")
+    if p.suffix.lower() in (".md", ".markdown"):
+        return parse_script(p)
     raw = p.read_text(encoding="utf-8")
     if p.suffix.lower() in (".yaml", ".yml"):
         try:
@@ -740,10 +902,29 @@ def cmd_build(args):
                              int(sc.get("rate", rate)))
 
         kind, src = "clip", None
-        if "clip" in sc:
+        if "card" in sc:
+            # a section card is just an image we render for you
+            kind = "image"
+            src = work / f"{tag}_card.png"
+            if not render_card(sc["card"], src, res):
+                die(f"{tag}: cannot render a card without a headless browser")
+        elif "terminal" in sc and sc["terminal"].get("run"):
+            # THE POINT: the tape is written now, sized to the narration we just
+            # measured, so a terminal scene can never outrun or trail its voice.
+            if not VHS:
+                die(f"{tag}: terminal scene needs vhs. Install with: brew install vhs")
+            hold = max(4.0, vo_dur - _typing_estimate(sc["terminal"]["run"]) + 2.5)
+            tape = write_tape(sc["terminal"]["run"], work / f"{tag}.tape", hold, res)
+            src = work / f"{tag}_term.mp4"
+            run([VHS, str(tape), "-o", str(src)])
+        elif "clip" in sc:
             src = (base / sc["clip"]) if not Path(sc["clip"]).is_absolute() else Path(sc["clip"])
             if not src.exists():
                 die(f"{tag}: clip not found: {src}")
+            if "from" in sc or "to" in sc:
+                start = float(sc.get("from", 0))
+                end = float(sc.get("to", probe_duration(src)))
+                src = trim_clip(src, work / f"{tag}_trim.mp4", start, end)
         elif "image" in sc:
             kind = "image"
             src = (base / sc["image"]) if not Path(sc["image"]).is_absolute() else Path(sc["image"])
@@ -885,6 +1066,8 @@ def cmd_plan(args):
         if "clip" in sc:
             src = resolve_path(base, sc["clip"])
             src_dur = probe_duration(src) if src.exists() else 0.0
+            if "from" in sc or "to" in sc:
+                src_dur = float(sc.get("to", src_dur)) - float(sc.get("from", 0))
             if not src.exists():
                 est = "clip MISSING"
         elif "image" in sc:
@@ -893,6 +1076,10 @@ def cmd_plan(args):
             src_dur = float(sc.get("pause") or 0)
         elif "screen" in sc:
             src_dur = float(sc["screen"].get("duration", 0))
+        elif "card" in sc:
+            src_dur = 0.0
+        elif "terminal" in sc and sc["terminal"].get("run"):
+            src_dur, est = vo_dur, "auto"
         elif "terminal" in sc:
             tape = resolve_path(base, sc["terminal"]["tape"])
             src_dur = estimate_tape_duration(tape) if tape.exists() else 0.0
